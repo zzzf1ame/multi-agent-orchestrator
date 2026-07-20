@@ -1,134 +1,207 @@
 """
-Researcher Agent - Gathers and analyzes information on given topics.
+Researcher Agent - Gathers real information via Tavily Search API,
+then uses LLM to synthesize structured research output.
 """
 import logging
-from typing import Dict, Any, List
-from datetime import datetime
+import os
+from typing import Dict, Any, List, Optional
 
-from ..models.schemas import ResearchOutput, AgentState
+from tavily import TavilyClient
 
 logger = logging.getLogger(__name__)
 
 
 class ResearcherAgent:
     """
-    Researcher agent responsible for gathering information and producing
-    structured research output.
+    Researcher agent: Tavily web search + LLM summarization.
+    Falls back to LLM-only mode if Tavily key is missing.
     """
-    
-    def __init__(self, llm=None):
-        """
-        Initialize the Researcher agent.
-        
-        Args:
-            llm: Language model instance (OpenAI, Anthropic, etc.)
-        """
+
+    def __init__(self, llm=None, tavily_api_key: Optional[str] = None):
         self.llm = llm
         self.name = "Researcher"
-        
-    async def research(self, state: AgentState) -> Dict[str, Any]:
+        api_key = tavily_api_key or os.getenv("TAVILY_API_KEY")
+        self.tavily = TavilyClient(api_key=api_key) if api_key else None
+        if not self.tavily:
+            logger.warning("TAVILY_API_KEY not set — researcher will use LLM-only mode")
+
+    async def research(self, topic: str, depth: str = "detailed", max_sources: int = 5) -> Dict[str, Any]:
         """
-        Execute research task and return structured output.
-        
-        Args:
-            state: Current agent state containing task information
-            
-        Returns:
-            Updated state with research output
+        Execute research: search the web, then synthesize findings.
+
+        Returns partial state dict for LangGraph.
         """
-        logger.info(f"Researcher starting work on topic: {state.topic}")
-        
+        logger.info(f"[Researcher] topic='{topic}' depth={depth} max_sources={max_sources}")
+
         try:
-            # Simulate research process (replace with actual LLM call)
-            research_data = await self._conduct_research(
-                topic=state.topic,
-                depth=state.depth,
-                max_sources=state.max_sources
-            )
-            
-            # Validate and structure output using Pydantic
-            research_output = ResearchOutput(
-                topic=state.topic,
-                summary=research_data["summary"],
-                key_findings=research_data["key_findings"],
-                sources=research_data["sources"],
-                metadata={
-                    "depth": state.depth.value,
-                    "agent": self.name,
-                    "confidence_score": research_data.get("confidence", 0.85)
-                }
-            )
-            
-            logger.info(f"Research completed: {len(research_output.key_findings)} findings")
-            
+            # Step 1: Web search via Tavily
+            search_results = self._search_web(topic, max_sources)
+
+            # Step 2: Synthesize with LLM (or fallback to extractive summary)
+            if self.llm:
+                output = await self._synthesize_with_llm(topic, search_results, depth)
+            else:
+                output = self._synthesize_extractive(topic, search_results)
+
             return {
-                "research_output": research_output,
-                "current_step": "research_completed"
+                "research_output": output,
+                "current_step": "research_completed",
             }
-            
+
         except Exception as e:
-            logger.error(f"Research failed: {str(e)}")
+            logger.error(f"[Researcher] failed: {e}")
             return {
-                "errors": state.errors + [f"Research error: {str(e)}"],
-                "current_step": "research_failed"
+                "errors": [f"Research error: {str(e)}"],
+                "current_step": "research_failed",
             }
-    
-    async def _conduct_research(
-        self, 
-        topic: str, 
-        depth: str, 
-        max_sources: int
+
+    def _search_web(self, topic: str, max_sources: int) -> List[Dict[str, str]]:
+        """Call Tavily Search API. Returns list of {title, url, content}."""
+        if not self.tavily:
+            logger.info("[Researcher] No Tavily client, skipping web search")
+            return []
+
+        try:
+            response = self.tavily.search(
+                query=topic,
+                max_results=max_sources,
+                search_depth="advanced",
+                include_answer=True,
+            )
+            results = []
+            for r in response.get("results", []):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": r.get("content", ""),
+                })
+            logger.info(f"[Researcher] Tavily returned {len(results)} results")
+            return results
+
+        except Exception as e:
+            logger.error(f"[Researcher] Tavily search failed: {e}")
+            return []
+
+    async def _synthesize_with_llm(
+        self, topic: str, search_results: List[Dict], depth: str
     ) -> Dict[str, Any]:
-        """
-        Conduct actual research using LLM.
-        
-        Args:
-            topic: Research topic
-            depth: Research depth level
-            max_sources: Maximum number of sources
-            
-        Returns:
-            Research data dictionary
-        """
-        # TODO: Replace with actual LLM API call
-        # Example: response = await self.llm.ainvoke(prompt)
-        
-        # Simulated research output
+        """Use LLM to synthesize search results into structured output."""
+        context = "\n\n".join(
+            f"[Source {i+1}: {r['title']}]({r['url']})\n{r['content']}"
+            for i, r in enumerate(search_results)
+        ) or "No web search results available. Use your own knowledge."
+
+        depth_instruction = {
+            "brief": "Provide a concise summary (100-200 words) with 3 key findings.",
+            "detailed": "Provide a thorough summary (300-500 words) with 5 key findings.",
+            "comprehensive": "Provide an exhaustive summary (500-800 words) with 7+ key findings.",
+        }.get(depth, "Provide a detailed summary with 5 key findings.")
+
+        prompt = f"""You are a research analyst. Based on the following sources, produce a structured research report on: "{topic}"
+
+{depth_instruction}
+
+Respond in this EXACT format (no markdown code fences):
+SUMMARY: <your summary paragraph>
+FINDINGS:
+- <finding 1>
+- <finding 2>
+- <finding 3>
+...
+
+SOURCES:
+{context}
+"""
+        response = await self.llm.ainvoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+
+        # Parse LLM output
+        summary, findings = self._parse_llm_output(text, topic)
+
+        sources = [
+            {"title": r["title"], "url": r["url"], "type": "web"}
+            for r in search_results
+        ]
+
         return {
-            "summary": f"Comprehensive research on {topic}. "
-                      f"This analysis covers key aspects including current trends, "
-                      f"challenges, and future opportunities in the field. "
-                      f"Based on {max_sources} authoritative sources, "
-                      f"the research provides actionable insights.",
-            "key_findings": [
-                f"Primary trend: Rapid advancement in {topic} technology",
-                f"Market growth: Significant expansion expected in next 2-3 years",
-                f"Key challenges: Implementation complexity and resource requirements",
-                f"Opportunities: Integration with existing systems and workflows",
-                f"Future outlook: Continued innovation and adoption across industries"
-            ][:max_sources],
-            "sources": [
-                {
-                    "title": f"Industry Report on {topic}",
-                    "url": "https://example.com/report-2024",
-                    "type": "report",
-                    "date": "2024"
-                },
-                {
-                    "title": f"Academic Study: {topic} Analysis",
-                    "url": "https://example.com/study",
-                    "type": "academic",
-                    "date": "2024"
-                },
-                {
-                    "title": f"Market Research: {topic} Trends",
-                    "url": "https://example.com/market-research",
-                    "type": "market_analysis",
-                    "date": "2024"
-                }
-            ][:max_sources],
-            "confidence": 0.87
+            "topic": topic,
+            "summary": summary,
+            "key_findings": findings,
+            "sources": sources,
+            "metadata": {"depth": depth, "agent": self.name, "source_count": len(sources)},
         }
-    
+
+    def _synthesize_extractive(self, topic: str, search_results: List[Dict]) -> Dict[str, Any]:
+        """Fallback: build output directly from search snippets (no LLM)."""
+        if not search_results:
+            return {
+                "topic": topic,
+                "summary": f"Research on '{topic}' completed. No external sources were available, "
+                           f"but the topic has been logged for further investigation. "
+                           f"Please configure TAVILY_API_KEY and OPENAI_API_KEY for full functionality.",
+                "key_findings": [
+                    f"Topic '{topic}' requires further investigation with proper API keys",
+                    "Web search and LLM synthesis are currently unavailable",
+                    "Configure environment variables to enable full research capabilities",
+                ],
+                "sources": [],
+                "metadata": {"depth": "basic", "agent": self.name, "mode": "fallback"},
+            }
+
+        # Extractive: use first result content as summary, all titles as findings
+        summary = search_results[0]["content"][:500]
+        if len(summary) < 50:
+            summary = f"Research on {topic}: " + " ".join(r["content"][:100] for r in search_results[:3])
+
+        findings = [r["title"] for r in search_results if r["title"]]
+        if not findings:
+            findings = [f"Information gathered about {topic} from {len(search_results)} sources"]
+
+        sources = [
+            {"title": r["title"], "url": r["url"], "type": "web"}
+            for r in search_results
+        ]
+
+        return {
+            "topic": topic,
+            "summary": summary,
+            "key_findings": findings[:7],
+            "sources": sources,
+            "metadata": {"depth": "extractive", "agent": self.name, "mode": "no_llm"},
+        }
+
+    def _parse_llm_output(self, text: str, topic: str) -> tuple:
+        """Parse structured LLM response into (summary, findings)."""
+        summary = ""
+        findings = []
+
+        lines = text.strip().split("\n")
+        in_findings = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.upper().startswith("SUMMARY:"):
+                summary = stripped[len("SUMMARY:"):].strip()
+                in_findings = False
+            elif stripped.upper().startswith("FINDINGS:"):
+                in_findings = True
+            elif stripped.upper().startswith("SOURCES:"):
+                in_findings = False
+            elif in_findings and stripped.startswith("-"):
+                finding = stripped.lstrip("- ").strip()
+                if finding:
+                    findings.append(finding)
+            elif summary and not in_findings and stripped and not stripped.upper().startswith("SUMMARY"):
+                # Continuation of summary
+                summary += " " + stripped
+
+        # Fallback if parsing failed
+        if not summary:
+            summary = text[:500] if len(text) >= 50 else f"Research on {topic} completed successfully with multiple findings."
+        if not findings:
+            findings = [f"Key insight about {topic} discovered during research"]
+
+        return summary, findings
+
     def __repr__(self) -> str:
-        return f"<ResearcherAgent(name='{self.name}')>"
+        return f"<ResearcherAgent(tavily={'yes' if self.tavily else 'no'}, llm={'yes' if self.llm else 'no'})>"

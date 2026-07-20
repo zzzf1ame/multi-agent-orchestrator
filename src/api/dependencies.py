@@ -1,5 +1,5 @@
 """
-FastAPI dependency injection for shared resources.
+FastAPI dependency injection — initializes LLM and orchestrator.
 """
 import os
 from typing import Optional
@@ -8,58 +8,49 @@ from functools import lru_cache
 from ..orchestrator import MultiAgentOrchestrator
 
 
-# Global orchestrator instance
 _orchestrator: Optional[MultiAgentOrchestrator] = None
 
 
 @lru_cache()
 def get_settings():
-    """Get application settings."""
     return {
         "openai_api_key": os.getenv("OPENAI_API_KEY"),
+        "tavily_api_key": os.getenv("TAVILY_API_KEY"),
+        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "log_level": os.getenv("LOG_LEVEL", "INFO"),
-        "max_workers": int(os.getenv("MAX_WORKERS", "4")),
-        "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379")
     }
 
 
 def get_orchestrator() -> MultiAgentOrchestrator:
-    """
-    Get or create the multi-agent orchestrator instance.
-    
-    Returns:
-        MultiAgentOrchestrator instance
-    """
+    """Get or create the multi-agent orchestrator instance."""
     global _orchestrator
-    
+
     if _orchestrator is None:
-        # Initialize LLM if API key is available
-        llm = None
         settings = get_settings()
-        
+        llm = None
+
         if settings["openai_api_key"]:
             try:
                 from langchain_openai import ChatOpenAI
                 llm = ChatOpenAI(
                     api_key=settings["openai_api_key"],
-                    model="gpt-3.5-turbo",
-                    temperature=0.7
+                    model=settings["openai_model"],
+                    temperature=0.7,
+                    timeout=60,
+                    max_retries=2,
                 )
-            except ImportError:
-                # OpenAI not available, use mock LLM
-                pass
-        
-        _orchestrator = MultiAgentOrchestrator(llm=llm)
-    
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Failed to init LLM: {e}")
+
+        _orchestrator = MultiAgentOrchestrator(
+            llm=llm,
+            tavily_api_key=settings["tavily_api_key"],
+        )
+
     return _orchestrator
 
 
 def get_task_manager():
-    """
-    Get task manager (placeholder for future Redis/database integration).
-    
-    Returns:
-        Task manager instance
-    """
-    # TODO: Implement Redis or database-based task manager
+    """Placeholder for future Redis/database task storage."""
     return None

@@ -1,201 +1,172 @@
 """
-Writer Agent - Creates structured articles based on research data.
+Writer Agent - Creates structured articles from research data using LLM.
+Falls back to template-based generation if LLM is unavailable.
 """
 import logging
-from typing import Dict, Any
-from datetime import datetime
-
-from ..models.schemas import ArticleOutput, AgentState, ResearchOutput
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class WriterAgent:
     """
-    Writer agent responsible for creating well-structured articles
-    based on research output.
+    Writer agent: takes research output and produces a structured article.
+    Uses LLM for generation when available, otherwise template fallback.
     """
-    
+
     def __init__(self, llm=None):
-        """
-        Initialize the Writer agent.
-        
-        Args:
-            llm: Language model instance (OpenAI, Anthropic, etc.)
-        """
         self.llm = llm
         self.name = "Writer"
-        
-    async def write_article(self, state: AgentState) -> Dict[str, Any]:
-        """
-        Create article based on research output.
-        
-        Args:
-            state: Current agent state containing research output
-            
-        Returns:
-            Updated state with article output
-        """
-        logger.info(f"Writer starting article creation for: {state.topic}")
-        
-        if not state.research_output:
-            error_msg = "No research output available for writing"
-            logger.error(error_msg)
-            return {
-                "errors": state.errors + [error_msg],
-                "current_step": "writing_failed"
-            }
-        
-        try:
-            # Generate article based on research
-            article_data = await self._generate_article(
-                research=state.research_output,
-                topic=state.topic
-            )
-            
-            # Validate and structure output using Pydantic
-            article_output = ArticleOutput(
-                title=article_data["title"],
-                content=article_data["content"],
-                word_count=len(article_data["content"].split()),
-                sections=article_data["sections"],
-                research_reference=state.task_id
-            )
-            
-            logger.info(f"Article completed: {article_output.word_count} words")
-            
-            return {
-                "article_output": article_output,
-                "current_step": "writing_completed"
-            }
-            
-        except Exception as e:
-            logger.error(f"Writing failed: {str(e)}")
-            return {
-                "errors": state.errors + [f"Writing error: {str(e)}"],
-                "current_step": "writing_failed"
-            }
-    
-    async def _generate_article(
-        self, 
-        research: ResearchOutput, 
-        topic: str
+
+    async def write_article(
+        self, topic: str, research_output: Dict[str, Any], task_id: str = ""
     ) -> Dict[str, Any]:
         """
-        Generate article content using LLM.
-        
-        Args:
-            research: Research output from Researcher agent
-            topic: Article topic
-            
-        Returns:
-            Article data dictionary
+        Generate article from research output.
+        Returns partial state dict for LangGraph.
         """
-        # TODO: Replace with actual LLM API call
-        # Example: response = await self.llm.ainvoke(prompt)
-        
-        # Create structured article based on research
-        title = f"Comprehensive Analysis: {topic}"
-        
-        sections = [
-            "Executive Summary",
-            "Key Findings",
-            "Detailed Analysis",
-            "Implications",
-            "Conclusion"
-        ]
-        
-        content = self._build_article_content(research, sections)
-        
+        logger.info(f"[Writer] topic='{topic}'")
+
+        if not research_output:
+            return {
+                "errors": ["No research output available for writing"],
+                "current_step": "writing_failed",
+            }
+
+        try:
+            if self.llm:
+                article = await self._generate_with_llm(topic, research_output)
+            else:
+                article = self._generate_template(topic, research_output)
+
+            return {
+                "article_output": article,
+                "current_step": "writing_completed",
+            }
+
+        except Exception as e:
+            logger.error(f"[Writer] failed: {e}")
+            return {
+                "errors": [f"Writing error: {str(e)}"],
+                "current_step": "writing_failed",
+            }
+
+    async def _generate_with_llm(self, topic: str, research: Dict[str, Any]) -> Dict[str, Any]:
+        """Use LLM to write a polished article from research data."""
+        summary = research.get("summary", "")
+        findings = research.get("key_findings", [])
+        sources = research.get("sources", [])
+
+        findings_text = "\n".join(f"- {f}" for f in findings)
+        sources_text = "\n".join(f"- [{s.get('title', '')}]({s.get('url', '')})" for s in sources)
+
+        prompt = f"""You are a professional technical writer. Write a well-structured article based on this research:
+
+TOPIC: {topic}
+
+RESEARCH SUMMARY:
+{summary}
+
+KEY FINDINGS:
+{findings_text}
+
+SOURCES:
+{sources_text}
+
+Write a complete article with these sections:
+1. Title (compelling, specific)
+2. Executive Summary (2-3 sentences)
+3. Key Findings (expand each finding into a paragraph)
+4. Analysis & Implications
+5. Conclusion
+
+Format your response as:
+TITLE: <article title>
+CONTENT:
+<full article in markdown format>
+"""
+        response = await self.llm.ainvoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+
+        title, content = self._parse_article(text, topic)
+        sections = ["Executive Summary", "Key Findings", "Analysis & Implications", "Conclusion"]
+
         return {
             "title": title,
             "content": content,
-            "sections": sections
+            "word_count": len(content.split()),
+            "sections": sections,
+            "research_reference": research.get("topic", topic),
         }
-    
-    def _build_article_content(
-        self, 
-        research: ResearchOutput, 
-        sections: list
-    ) -> str:
-        """
-        Build structured article content.
-        
-        Args:
-            research: Research output
-            sections: Article sections
-            
-        Returns:
-            Complete article content
-        """
-        content_parts = []
-        
-        # Executive Summary
-        content_parts.append("## Executive Summary\n")
-        content_parts.append(f"{research.summary}\n\n")
-        
-        # Key Findings
-        content_parts.append("## Key Findings\n")
-        for i, finding in enumerate(research.key_findings, 1):
-            content_parts.append(f"{i}. {finding}\n")
-        content_parts.append("\n")
-        
-        # Detailed Analysis
-        content_parts.append("## Detailed Analysis\n")
-        content_parts.append(
-            f"Our comprehensive analysis of {research.topic} reveals several "
-            f"critical insights that organizations should consider. The research "
-            f"indicates significant developments in this area, with implications "
-            f"for both current operations and future strategic planning.\n\n"
-        )
-        
-        # Expand on each key finding
-        for finding in research.key_findings:
-            content_parts.append(f"### {finding}\n")
-            content_parts.append(
-                f"This finding represents a crucial aspect of {research.topic}. "
-                f"The implications extend beyond immediate applications to "
-                f"long-term strategic considerations. Organizations should "
-                f"evaluate their current capabilities and develop appropriate "
-                f"response strategies.\n\n"
-            )
-        
-        # Implications
-        content_parts.append("## Implications\n")
-        content_parts.append(
-            f"The research findings on {research.topic} have several important "
-            f"implications for stakeholders:\n\n"
-            f"- **Strategic Planning**: Organizations need to incorporate these "
-            f"insights into their long-term planning processes.\n"
-            f"- **Resource Allocation**: Investment priorities may need to be "
-            f"adjusted based on emerging trends.\n"
-            f"- **Risk Management**: New challenges require updated risk "
-            f"assessment and mitigation strategies.\n"
-            f"- **Competitive Advantage**: Early adoption of best practices "
-            f"can provide significant market advantages.\n\n"
-        )
-        
-        # Conclusion
-        content_parts.append("## Conclusion\n")
-        content_parts.append(
-            f"This analysis of {research.topic} demonstrates the importance of "
-            f"staying informed about developments in this rapidly evolving field. "
-            f"The key findings highlight both opportunities and challenges that "
-            f"organizations must navigate to remain competitive and effective.\n\n"
-            f"Moving forward, continued monitoring and adaptation will be essential "
-            f"for success in this dynamic environment.\n\n"
-        )
-        
-        # Sources
-        if research.sources:
-            content_parts.append("## References\n")
-            for i, source in enumerate(research.sources, 1):
-                content_parts.append(
-                    f"{i}. {source.get('title', 'Unknown Title')} - "
-                    f"{source.get('url', 'No URL')}\n"
-                )
-        
-        return "".join(content_parts)
-    
+
+    def _generate_template(self, topic: str, research: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback: build article from template (no LLM needed)."""
+        summary = research.get("summary", "No summary available.")
+        findings = research.get("key_findings", [])
+        sources = research.get("sources", [])
+
+        title = f"Research Report: {topic}"
+        sections = ["Executive Summary", "Key Findings", "Analysis", "Conclusion", "References"]
+
+        parts = [
+            f"# {title}\n",
+            "## Executive Summary\n",
+            f"{summary}\n\n",
+            "## Key Findings\n",
+        ]
+        for i, finding in enumerate(findings, 1):
+            parts.append(f"### {i}. {finding}\n")
+            parts.append(f"This finding highlights an important aspect of {topic} "
+                         f"that warrants further attention and investigation.\n\n")
+
+        parts.append("## Analysis & Implications\n")
+        parts.append(f"The research on {topic} reveals several important patterns. "
+                     f"Organizations and researchers should consider these findings "
+                     f"when planning future work in this area.\n\n")
+
+        parts.append("## Conclusion\n")
+        parts.append(f"This report synthesizes current knowledge on {topic} "
+                     f"based on {len(sources)} sources. Continued monitoring and "
+                     f"research in this area is recommended.\n\n")
+
+        if sources:
+            parts.append("## References\n")
+            for i, s in enumerate(sources, 1):
+                parts.append(f"{i}. [{s.get('title', 'Untitled')}]({s.get('url', '#')})\n")
+
+        content = "".join(parts)
+
+        return {
+            "title": title,
+            "content": content,
+            "word_count": len(content.split()),
+            "sections": sections,
+            "research_reference": topic,
+        }
+
+    def _parse_article(self, text: str, topic: str) -> tuple:
+        """Parse LLM output into (title, content)."""
+        title = f"Research Report: {topic}"
+        content = text
+
+        lines = text.strip().split("\n")
+        content_start = 0
+
+        for i, line in enumerate(lines):
+            if line.strip().upper().startswith("TITLE:"):
+                title = line.strip()[len("TITLE:"):].strip()
+            elif line.strip().upper().startswith("CONTENT:"):
+                content_start = i + 1
+                break
+
+        if content_start > 0:
+            content = "\n".join(lines[content_start:]).strip()
+
+        # Ensure minimum content length
+        if len(content) < 100:
+            content = text
+
+        return title, content
+
     def __repr__(self) -> str:
-        return f"<WriterAgent(name='{self.name}')>"
+        return f"<WriterAgent(llm={'yes' if self.llm else 'no'})>"
