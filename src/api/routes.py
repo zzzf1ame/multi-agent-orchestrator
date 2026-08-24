@@ -3,6 +3,7 @@ FastAPI routes for the multi-agent orchestrator API.
 Adapted for langgraph 1.x dict-based state.
 """
 import logging
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 import uuid
@@ -20,8 +21,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["research"])
 
-# In-memory task storage
+# In-memory task storage (bounded: finished tasks are pruned oldest-first)
 task_storage: Dict[str, Dict[str, Any]] = {}
+MAX_STORED_TASKS = int(os.getenv("MAX_STORED_TASKS", "1000"))
+
+
+def _prune_task_storage() -> None:
+    """Evict oldest finished tasks when storage exceeds MAX_STORED_TASKS."""
+    overflow = len(task_storage) - MAX_STORED_TASKS
+    if overflow <= 0:
+        return
+    finished = [
+        t for t in task_storage.values()
+        if t["status"] in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+    ]
+    finished.sort(key=lambda t: t.get("completed_at") or t["started_at"])
+    for task in finished[:overflow]:
+        task_storage.pop(task["task_id"], None)
 
 
 @router.post("/research", response_model=TaskResponse)
@@ -34,6 +50,7 @@ async def create_research_task(
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     logger.info(f"Creating task {task_id}: '{request.topic}'")
 
+    _prune_task_storage()
     task_storage[task_id] = {
         "task_id": task_id,
         "status": TaskStatus.PENDING,
@@ -73,14 +90,14 @@ async def get_research_task(task_id: str) -> TaskResult:
     if result.get("research_output"):
         try:
             research = ResearchOutput(**result["research_output"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse research_output for {task_id}: {e}")
 
     if result.get("article_output"):
         try:
             article = ArticleOutput(**result["article_output"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse article_output for {task_id}: {e}")
 
     return TaskResult(
         task_id=task_id,
@@ -103,7 +120,7 @@ async def list_research_tasks(
     if status:
         tasks = [t for t in tasks if t["status"] == status]
     tasks.sort(key=lambda x: x["started_at"], reverse=True)
-    return {"tasks": tasks[:limit], "total": len(task_storage)}
+    return {"tasks": tasks[:limit], "total": len(task_storage), "filtered": len(tasks)}
 
 
 @router.delete("/research/{task_id}")
@@ -124,6 +141,7 @@ async def health_check() -> Dict[str, Any]:
             t for t in task_storage.values()
             if t["status"] in (TaskStatus.PENDING, TaskStatus.RESEARCHING, TaskStatus.WRITING)
         ]),
+        "total_tasks": len(task_storage),
     }
 
 
