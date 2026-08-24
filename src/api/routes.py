@@ -90,14 +90,14 @@ async def get_research_task(task_id: str) -> TaskResult:
     if result.get("research_output"):
         try:
             research = ResearchOutput(**result["research_output"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse research_output for {task_id}: {e}")
 
     if result.get("article_output"):
         try:
             article = ArticleOutput(**result["article_output"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse article_output for {task_id}: {e}")
 
     return TaskResult(
         task_id=task_id,
